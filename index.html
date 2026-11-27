@@ -1443,7 +1443,7 @@
             }
           });
           p.push("<p class=\"note\">この文書は記録支援アプリ「お天気メモ」で作成されました。本アプリは、記録がいつ作成され、その後書き換えられていないことを技術的に示すものです。記録は作成者の端末内にのみ保存され、この文書はその端末上で生成されています。添付ファイル（写真・音声）は記録本体とは別に、ファイルごとにSHA-256の指紋を取り、端末内に原本を保管しています（この文書にはファイル自体は含まれません）。記録内容の真実性そのものを保証するものではありません。個別の法的判断については、弁護士や法テラスなどの公的相談窓口にご相談ください。</p>");
-          p.push("<script>if('serviceWorker' in navigator){window.addEventListener('load',()=>{navigator.serviceWorker.register('sw.js').catch(()=>{});});}</script></body></html>");
+          p.push("</body></html>");
           var stamp = generatedAt.getFullYear() + "-" + pad(generatedAt.getMonth() + 1) + "-" + pad(generatedAt.getDate());
           return {
             html: p.join("\n"),
@@ -1904,5 +1904,5 @@
       }
       init();
     </script>
-  </body>
+  <script>if('serviceWorker' in navigator){window.addEventListener('load',()=>{navigator.serviceWorker.register('sw.js').catch(()=>{});});}</script></body>
 </html>
