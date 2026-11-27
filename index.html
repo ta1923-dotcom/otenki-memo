@@ -400,6 +400,8 @@
         copy: '<rect x="8" y="8" width="14" height="14" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
         check: '<path d="M20 6 9 17l-5-5"/>',
         download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/>',
+        upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/>',
+        save: '<path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/>',
         searchCheck: '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="m8.5 11 2 2 3.5-3.5"/>',
         link: '<path d="M9 17H7A5 5 0 0 1 7 7h2"/><path d="M15 7h2a5 5 0 1 1 0 10h-2"/><path d="M8 12h8"/>',
         info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',
@@ -679,6 +681,143 @@
             var tx = db.transaction(["records", "edits", "attachments", "settings"], "readwrite");
             ["records", "edits", "attachments", "settings"].forEach(function (s) {
               tx.objectStore(s).clear();
+            });
+            tx.oncomplete = function () { resolve(); };
+            tx.onerror = function () { reject(tx.error); };
+            tx.onabort = function () { reject(tx.error || new Error("aborted")); };
+          });
+        });
+      }
+
+      // ---------- 暗号化バックアップ ----------
+      // 全データを1つのJSONにまとめ、利用者がその場で決めたパスワードで
+      // 暗号化してファイルとして書き出す。復元もこの端末の中で行い、
+      // サーバーへは何も送信しない。
+      // 暗号方式：PBKDF2（SHA-256）で鍵を導出し、AES-GCMで暗号化する。
+      var BACKUP_FORMAT = "otenki-memo-backup";
+      var BACKUP_PBKDF2_ITERATIONS = 310000;
+
+      function bufToBase64(buf) {
+        var bytes = new Uint8Array(buf);
+        var s = "";
+        var CHUNK = 0x8000;
+        for (var i = 0; i < bytes.length; i += CHUNK) {
+          s += String.fromCharCode.apply(null, Array.prototype.slice.call(bytes.subarray(i, i + CHUNK)));
+        }
+        return btoa(s);
+      }
+      function base64ToBuf(b64) {
+        var s = atob(String(b64 || ""));
+        var bytes = new Uint8Array(s.length);
+        for (var i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
+        return bytes.buffer;
+      }
+      function deriveBackupKey(password, salt, iterations, usage) {
+        return crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]).then(function (baseKey) {
+          return crypto.subtle.deriveKey(
+            { name: "PBKDF2", salt: salt, iterations: iterations, hash: "SHA-256" },
+            baseKey,
+            { name: "AES-GCM", length: 256 },
+            false,
+            [usage]
+          );
+        });
+      }
+      function collectBackupPayload() {
+        return Promise.all([dbGetAll("records"), dbGetAll("edits"), dbGetAll("attachments")]).then(function (res) {
+          var attJobs = res[2].map(function (a) {
+            var blob = a.blob;
+            if (!blob || typeof blob.arrayBuffer !== "function") return Promise.resolve(null);
+            return blob.arrayBuffer().then(function (buf) {
+              return {
+                id: a.id, recordId: a.recordId, kind: a.kind, mimeType: a.mimeType,
+                sizeBytes: a.sizeBytes, sha256: a.sha256,
+                durationSec: a.durationSec != null ? a.durationSec : null,
+                capturedAt: a.capturedAt || null, createdAt: a.createdAt || null,
+                data: bufToBase64(buf)
+              };
+            });
+          });
+          return Promise.all(attJobs).then(function (attData) {
+            return {
+              format: BACKUP_FORMAT,
+              version: 1,
+              exportedAt: new Date().toISOString(),
+              records: res[0],
+              edits: res[1],
+              attachments: attData.filter(function (x) { return x !== null; })
+            };
+          });
+        });
+      }
+      function encryptBackupText(plainText, password) {
+        var salt = crypto.getRandomValues(new Uint8Array(16));
+        var iv = crypto.getRandomValues(new Uint8Array(12));
+        return deriveBackupKey(password, salt, BACKUP_PBKDF2_ITERATIONS, "encrypt").then(function (key) {
+          return crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, key, new TextEncoder().encode(plainText));
+        }).then(function (cipherBuf) {
+          return JSON.stringify({
+            format: BACKUP_FORMAT,
+            version: 1,
+            kdf: { name: "PBKDF2", hash: "SHA-256", iterations: BACKUP_PBKDF2_ITERATIONS, salt: bufToBase64(salt.buffer) },
+            cipher: { name: "AES-GCM", iv: bufToBase64(iv.buffer) },
+            data: bufToBase64(cipherBuf)
+          }, null, 2);
+        });
+      }
+      function decryptBackupText(envelopeText, password) {
+        var env = null;
+        try { env = JSON.parse(envelopeText); } catch (e) { env = null; }
+        if (!env || env.format !== BACKUP_FORMAT || !env.kdf || !env.cipher || !env.data) {
+          return Promise.reject(new Error("invalid-file"));
+        }
+        var salt = new Uint8Array(base64ToBuf(env.kdf.salt));
+        var iv = new Uint8Array(base64ToBuf(env.cipher.iv));
+        var iterations = Number(env.kdf.iterations) || BACKUP_PBKDF2_ITERATIONS;
+        return deriveBackupKey(password, salt, iterations, "decrypt").then(function (key) {
+          return crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, base64ToBuf(env.data));
+        }).then(function (plainBuf) {
+          return new TextDecoder().decode(plainBuf);
+        });
+      }
+      function readFileText(file) {
+        if (file && typeof file.text === "function") return file.text();
+        return new Promise(function (resolve, reject) {
+          var reader = new FileReader();
+          reader.onload = function () { resolve(String(reader.result || "")); };
+          reader.onerror = function () { reject(reader.error || new Error("read failed")); };
+          reader.readAsText(file);
+        });
+      }
+      function restoreBackupPayload(payload) {
+        if (!payload || payload.format !== BACKUP_FORMAT ||
+            !Array.isArray(payload.records) || !Array.isArray(payload.edits) || !Array.isArray(payload.attachments)) {
+          return Promise.reject(new Error("invalid-data"));
+        }
+        return openDB().then(function (db) {
+          return new Promise(function (resolve, reject) {
+            var tx = db.transaction(["records", "edits", "attachments"], "readwrite");
+            tx.objectStore("records").clear();
+            tx.objectStore("edits").clear();
+            tx.objectStore("attachments").clear();
+            var rs = tx.objectStore("records");
+            payload.records.forEach(function (r) {
+              var clean = Object.assign({}, r);
+              delete clean.edits;
+              delete clean.attachments;
+              rs.put(clean);
+            });
+            var es = tx.objectStore("edits");
+            payload.edits.forEach(function (e) { es.put(e); });
+            var as = tx.objectStore("attachments");
+            payload.attachments.forEach(function (a) {
+              var blob = new Blob([base64ToBuf(a.data)], { type: a.mimeType || "application/octet-stream" });
+              as.put({
+                id: a.id, recordId: a.recordId, kind: a.kind, mimeType: a.mimeType,
+                blob: blob, sizeBytes: a.sizeBytes, sha256: a.sha256,
+                durationSec: a.durationSec != null ? a.durationSec : null,
+                capturedAt: a.capturedAt || null, createdAt: a.createdAt || null
+              });
             });
             tx.oncomplete = function () { resolve(); };
             tx.onerror = function () { reject(tx.error); };
@@ -1607,7 +1746,8 @@
       function renderGuide() {
         var el = $("tab-guide");
         var h = '<div class="stack">';
-        h += '<section class="card"><h2 class="font-mincho" style="margin:0;font-size:1.125rem;font-weight:600;">制作者からのアドバイス</h2><p class=\"small\" style=\"margin:0.5rem 0 0;line-height:1.8;\">制作：Piera | Independent Creative Studio</p>' +
+        h += '<section class="card"><h2 class="font-mincho" style="margin:0;font-size:1.125rem;font-weight:600;">制作者からのアドバイス</h2>' +
+          '<p class="xs dim" style="margin:0.375rem 0 0;">制作：Piera | Independent Creative Studio</p>' +
           '<p class="small" style="margin:0.5rem 0 0;line-height:1.8;">正直に言います。このアプリがあっても、争いに「絶対勝てる」とは約束できません。それを約束するサービスがあったら、そちらを疑ってください。</p>' +
           '<p class="small" style="margin:0.5rem 0 0;line-height:1.8;">ただ、勝敗を分けるものはほぼ決まっていて、それは<strong>記録の質</strong>です。記録をつけていないだけで損をしている人は本当に多くて、逆に言えば、淡々と積み上がった1ヶ月分の事実は、学校にも会社にも一番効きます。感情の訴えは流せても、日付の入った時系列は流せないからです。</p>' +
           '<p class="small" style="margin:0.5rem 0 0;line-height:1.8;">耐えるだけの1ヶ月と、記録しながら戦う1ヶ月は、意味がまったく違います。このアプリは、その「勝てる記録」を作るための道具です。</p></section>';
@@ -1638,6 +1778,7 @@
 
       // ---------- 設定 ----------
       var settingsState = { message: null, error: null, confirmWipe: false, busy: false };
+      var backupState = { message: null, error: null, busy: false, fileObj: null, fileName: "", confirm: null, pendingPayload: null };
       function renderSettings() {
         var el = $("tab-settings");
         var ss = settingsState;
@@ -1678,11 +1819,54 @@
           icon("info", 18) + "プライバシーと免責</h2>" +
           '<ul class="disc" style="margin-top:0.5rem;">' +
           "<li>記録・写真・音声は、すべてこの端末の中（ブラウザの保存領域）にだけ保存されます。サーバーへ送信されることは一切なく、運営者があなたの記録の内容を見ることもできません。</li>" +
-          "<li>その代わり、端末を失くしたり、機種変更でブラウザのデータが消えたりすると、記録も一緒に失われます。大事な記録は「文書」タブから提出用文書を作成し、別の場所にも保管してください。</li>" +
+          "<li>その代わり、端末を失くしたり、機種変更でブラウザのデータが消えたりすると、記録も一緒に失われます。大事な記録は、下の「暗号化バックアップ」で控えを取り、「文書」タブの提出用文書も別の場所に保管してください。</li>" +
           "<li>ブラウザの「サイトデータを削除」やプライベートブラウズ（シークレットモード）では記録が残らない場合があります。通常モードで使ってください。</li>" +
           "<li>このアプリは記録を支援する道具であり、法的助言を行うものではありません。具体的な判断は、弁護士や法テラスなどの公的窓口にご相談ください。</li>" +
           "<li>身の危険を感じる時は、記録より先に安全の確保を。緊急時は110番へ。</li>" +
           "</ul></section>";
+        // 暗号化バックアップ
+        var bs = backupState;
+        h += '<section class="card"><h2 class="font-mincho" style="margin:0;font-size:1.125rem;font-weight:600;display:flex;align-items:center;gap:0.5rem;">' +
+          icon("save", 18) + "暗号化バックアップ</h2>" +
+          '<p class="small dim" style="margin:0.25rem 0 0;line-height:1.8;">記録はこの端末の中にだけあるので、スマホが壊れたり、機種変更でブラウザのデータが消えたりすると、記録も一緒に消えてしまいます。バックアップを作っておけば、あとから記録を元に戻せます。作るかどうかは自由です。預けたい人だけが、自分で預ける——そのための仕組みです。</p>' +
+          '<ul class="disc" style="margin-top:0.5rem;">' +
+          "<li>バックアップには、すべての記録（出来事・体調）・編集履歴・添付した写真と音声の中身・検証コードや記録の鎖のもとになる情報が、すべて入ります。</li>" +
+          "<li>バックアップは、あなたがその場で決めるパスワードで暗号化されます（PBKDF2で鍵を作り、AES-GCMで暗号化）。暗号化も復元もこの端末の中で行われ、サーバーへ送られることはありません。</li>" +
+          "<li>パスワードを忘れると、あなた自身も、運営者も、誰にも復元できません。パスワードは必ず、ファイルとは別の場所にメモしておいてください。</li>" +
+          "<li>ファイル自体は暗号化されているので、自分のクラウドやPCなど、好きな場所に置いて大丈夫です。パスワードさえ別に管理すれば、中身を見られることはありません。</li>" +
+          "</ul>";
+        if (bs.message) h += '<p class="small ok-text" role="status" style="margin:0.75rem 0 0;line-height:1.7;">' + esc(bs.message) + "</p>";
+        if (bs.error) h += '<p class="small accent-text" role="alert" style="margin:0.75rem 0 0;line-height:1.7;">' + esc(bs.error) + "</p>";
+        h += '<h3 class="small" style="margin:1.25rem 0 0;font-weight:600;">バックアップを作る</h3>' +
+          '<form id="bkExportForm" style="margin-top:0.5rem;">' +
+          '<div><label class="label" for="bkPw1">バックアップのパスワード</label>' +
+          '<input id="bkPw1" class="input" type="password" autocomplete="new-password" placeholder="8文字以上で決めてください"></div>' +
+          '<div style="margin-top:0.5rem;"><label class="label" for="bkPw2">パスワード（確認）</label>' +
+          '<input id="bkPw2" class="input" type="password" autocomplete="new-password" placeholder="同じパスワードをもう一度"></div>' +
+          '<button type="submit" class="btn-primary" style="margin-top:0.75rem;width:100%;"' + (bs.busy ? " disabled" : "") + ">" +
+          icon("download", 17) + (bs.busy ? "処理しています…" : "バックアップをダウンロード") + "</button>" +
+          '<p class="xs dim" style="margin:0.5rem 0 0;">ファイル名は otenki-memo-backup-（日付）.otenki になります。</p></form>';
+        h += '<h3 class="small" style="margin:1.5rem 0 0;font-weight:600;">バックアップから復元する</h3>' +
+          '<p class="small dim" style="margin:0.25rem 0 0;line-height:1.8;">復元すると、今この端末にある記録はすべて消えて、バックアップの中身に置き換わります。</p>' +
+          '<div style="margin-top:0.75rem;display:flex;gap:0.5rem;align-items:stretch;">' +
+          '<button type="button" class="btn-ghost" id="bkFileBtn" style="flex-shrink:0;"' + (bs.busy ? " disabled" : "") + ">" + icon("upload", 16) + "ファイルを選ぶ</button>" +
+          '<span class="small" id="bkFileName" style="align-self:center;min-width:0;word-break:break-all;">' +
+          (bs.fileName ? esc(bs.fileName) : "選択されていません") + "</span></div>" +
+          '<input type="file" id="bkFileInput" accept=".otenki" hidden aria-label="バックアップファイルを選ぶ">' +
+          '<div style="margin-top:0.5rem;"><label class="label" for="bkRestorePw">バックアップのパスワード</label>' +
+          '<input id="bkRestorePw" class="input" type="password" autocomplete="off" placeholder="バックアップを作った時のパスワード"></div>' +
+          '<button type="button" class="btn-ghost" id="bkRestoreBtn" style="margin-top:0.75rem;width:100%;color:var(--sky-accent);border-color:var(--sky-accent);"' +
+          (bs.busy ? " disabled" : "") + ">" + (bs.busy ? "処理しています…" : "復元する") + "</button>";
+        if (bs.confirm) {
+          h += '<div class="solid-box" style="margin-top:0.75rem;">' +
+            '<p class="small" style="margin:0;line-height:1.8;">バックアップを読み込めました（記録' + bs.confirm.records + "件・添付" + bs.confirm.attachments + "件" +
+            (bs.confirm.exportedAt ? "／" + esc(fmtRecorded(bs.confirm.exportedAt)) + "に作成" : "") + "）。</p>" +
+            '<p class="small accent-text" style="margin:0.5rem 0 0;line-height:1.8;">復元すると、今この端末にある記録' + state.records.length + "件はすべて消えます。本当に復元しますか？</p>" +
+            '<div style="margin-top:0.75rem;display:flex;gap:0.5rem;">' +
+            '<button type="button" id="bkRestoreYesBtn" class="btn-primary" style="background:var(--accent);"' + (bs.busy ? " disabled" : "") + ">今のデータを消して復元する</button>" +
+            '<button type="button" id="bkRestoreNoBtn" class="btn-ghost">やめる</button></div></div>';
+        }
+        h += "</section>";
         // データ削除
         h += '<section class="card"><h2 class="font-mincho" style="margin:0;font-size:1.125rem;font-weight:600;display:flex;align-items:center;gap:0.5rem;">' +
           icon("alert", 18) + "記録をすべて消す</h2>" +
@@ -1769,6 +1953,137 @@
             settingsState.error = "設定を変更できませんでした。";
             renderSettings();
           });
+        });
+        // 暗号化バックアップ：書き出し
+        $("bkExportForm").addEventListener("submit", function (ev) {
+          ev.preventDefault();
+          var pw1 = $("bkPw1").value;
+          var pw2 = $("bkPw2").value;
+          backupState.error = null;
+          backupState.message = null;
+          if (pw1.length < 8) {
+            backupState.error = "パスワードは8文字以上にしてください。";
+            renderSettings();
+            return;
+          }
+          if (pw1 !== pw2) {
+            backupState.error = "確認用パスワードが一致しません。";
+            renderSettings();
+            return;
+          }
+          backupState.busy = true;
+          renderSettings();
+          collectBackupPayload().then(function (payload) {
+            return encryptBackupText(JSON.stringify(payload), pw1);
+          }).then(function (text) {
+            var blob = new Blob([text], { type: "application/octet-stream" });
+            var url = URL.createObjectURL(blob);
+            var d = new Date();
+            var a = document.createElement("a");
+            a.href = url;
+            a.download = "otenki-memo-backup-" + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + ".otenki";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+            backupState.busy = false;
+            backupState.message = "バックアップを書き出しました。ファイルとパスワードは、別々の場所に保管してください。";
+            renderSettings();
+          }).catch(function () {
+            backupState.busy = false;
+            backupState.error = "バックアップを書き出せませんでした。もう一度お試しください。";
+            renderSettings();
+          });
+        });
+        // 暗号化バックアップ：ファイル選択
+        $("bkFileBtn").addEventListener("click", function () { $("bkFileInput").click(); });
+        $("bkFileInput").addEventListener("change", function (e) {
+          var f = e.target.files && e.target.files[0];
+          if (f) {
+            backupState.fileObj = f;
+            backupState.fileName = f.name;
+            backupState.confirm = null;
+            backupState.pendingPayload = null;
+            backupState.error = null;
+            backupState.message = null;
+            var label = $("bkFileName");
+            if (label) label.textContent = f.name;
+          }
+          e.target.value = "";
+        });
+        // 暗号化バックアップ：復号して確認へ
+        $("bkRestoreBtn").addEventListener("click", function () {
+          var pw = $("bkRestorePw").value;
+          backupState.error = null;
+          backupState.message = null;
+          backupState.confirm = null;
+          backupState.pendingPayload = null;
+          if (!backupState.fileObj) {
+            backupState.error = "先にバックアップファイルを選んでください。";
+            renderSettings();
+            return;
+          }
+          if (!pw) {
+            backupState.error = "バックアップのパスワードを入力してください。";
+            renderSettings();
+            return;
+          }
+          backupState.busy = true;
+          renderSettings();
+          readFileText(backupState.fileObj).then(function (text) {
+            return decryptBackupText(text, pw);
+          }).then(function (plain) {
+            var payload = null;
+            try { payload = JSON.parse(plain); } catch (e) { payload = null; }
+            if (!payload || payload.format !== BACKUP_FORMAT ||
+                !Array.isArray(payload.records) || !Array.isArray(payload.edits) || !Array.isArray(payload.attachments)) {
+              throw new Error("invalid-data");
+            }
+            backupState.busy = false;
+            backupState.pendingPayload = payload;
+            backupState.confirm = {
+              records: payload.records.length,
+              attachments: payload.attachments.length,
+              exportedAt: payload.exportedAt || null
+            };
+            renderSettings();
+          }).catch(function () {
+            backupState.busy = false;
+            backupState.error = "復元できませんでした。パスワードが違うか、ファイルが壊れている可能性があります。";
+            renderSettings();
+          });
+        });
+        var bkYes = $("bkRestoreYesBtn");
+        if (bkYes) bkYes.addEventListener("click", function () {
+          if (!backupState.pendingPayload) return;
+          backupState.busy = true;
+          renderSettings();
+          restoreBackupPayload(backupState.pendingPayload).then(function () {
+            backupState.pendingPayload = null;
+            backupState.confirm = null;
+            backupState.fileObj = null;
+            backupState.fileName = "";
+            state.historyOpen = {};
+            exportState.result = null;
+            return refreshData();
+          }).then(function () {
+            backupState.busy = false;
+            backupState.error = null;
+            backupState.message = state.chain && state.chain.ok
+              ? "復元が完了しました。記録の鎖の検証も「正常」です。"
+              : "復元は完了しましたが、記録の鎖の検証で異常が検出されました。";
+            renderSettings();
+          }).catch(function () {
+            backupState.busy = false;
+            backupState.error = "復元に失敗しました。もう一度お試しください。";
+            renderSettings();
+          });
+        });
+        var bkNo = $("bkRestoreNoBtn");
+        if (bkNo) bkNo.addEventListener("click", function () {
+          backupState.confirm = null;
+          backupState.pendingPayload = null;
+          renderSettings();
         });
         var wipeBtn = $("wipeBtn");
         if (wipeBtn) wipeBtn.addEventListener("click", function () {
